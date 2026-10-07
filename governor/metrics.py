@@ -27,6 +27,8 @@ class ScopeMetrics:
     degraded: int = 0
     failed: int = 0
     canceled: int = 0
+    invalidated: int = 0      # 等待中结果被判作废的请求数
+    invalidations: int = 0    # 主动作废操作次数（含未命中）
     coalesced: int = 0
     cache_hit: int = 0
     executions: int = 0
@@ -69,7 +71,12 @@ class MetricsRegistry:
         caller: str | None,
         **fields: object,
     ) -> None:
-        for name in ("total", f"endpoint:{endpoint}", f"caller:{caller}"):
+        names = ["total"]
+        if endpoint is not None:
+            names.append(f"endpoint:{endpoint}")
+        if caller is not None:
+            names.append(f"caller:{caller}")
+        for name in names:
             self._scope(name).add(**fields)
 
     def observe_gate_states(self, states: dict[tuple[str, str], tuple[int, int]]) -> None:

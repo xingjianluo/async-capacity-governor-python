@@ -25,6 +25,7 @@ from .governor import (
     STATUS_CACHE,
     STATUS_COALESCED,
     STATUS_DEGRADED,
+    STATUS_INVALIDATED,
     Governor,
 )
 from .metrics import MetricsRegistry
@@ -185,6 +186,23 @@ def create_app(store: ConfigStore | None = None) -> FastAPI:
             "flights": governor.coalescer.flight_count(),
         }
 
+    @app.post("/admin/invalidate")
+    async def admin_invalidate(request: Request) -> JSONResponse:
+        payload = await request.json()
+        key = payload.get("key")
+        if not isinstance(key, str) or not key:
+            return JSONResponse(
+                status_code=400,
+                content={"error": "invalid_request", "detail": "missing 'key'"},
+            )
+        hit = governor.invalidate(
+            key,
+            endpoint=payload.get("endpoint"),
+            caller=payload.get("caller"),
+        )
+        # 重复作废 / 作废不存在的 key 同样返回 200，由 invalidated 字段区分
+        return JSONResponse({"status": "ok", "key": key, "invalidated": hit})
+
     @app.post("/admin/config")
     async def admin_config(request: Request) -> JSONResponse:
         payload = await request.json()
@@ -243,6 +261,17 @@ def _outcome_to_response(rid: str, outcome: Any) -> JSONResponse:
                 "request_id": rid,
                 "status": "canceled",
                 "error": "client_canceled",
+            },
+        )
+    if outcome.status == STATUS_INVALIDATED:
+        return JSONResponse(
+            status_code=409,
+            content={
+                "request_id": rid,
+                "status": "invalidated",
+                "error": "result_invalidated",
+                "detail": "共享结果已被作废，请重试以获取最新值",
+                "timing": _timing(outcome),
             },
         )
     # success / cache / coalesced / degraded

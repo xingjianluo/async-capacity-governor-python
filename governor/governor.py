@@ -21,6 +21,7 @@ from .errors import (
     GovernorError,
     QueueRejected,
     QueueTimeout,
+    ResultInvalidated,
 )
 from .metrics import (
     REASON_CAPACITY_FULL,
@@ -39,6 +40,7 @@ STATUS_DEGRADED = "degraded"          # 容量拒绝/执行失败后降级
 STATUS_REJECTED = "rejected"          # 容量拒绝（不降级）
 STATUS_FAILED = "failed"              # 执行失败（不降级）
 STATUS_CANCELED = "canceled"          # 客户端取消
+STATUS_INVALIDATED = "invalidated"    # 等待中的共享结果被主动作废
 
 
 @dataclass
@@ -61,6 +63,7 @@ _COUNTER_MAP = {
     STATUS_REJECTED: "rejected",
     STATUS_FAILED: "failed",
     STATUS_CANCELED: "canceled",
+    STATUS_INVALIDATED: "invalidated",
 }
 
 
@@ -90,6 +93,25 @@ class Governor:
         snap = self.config.get()
         for (ep, caller), gate in self.limiter._gates.items():  # noqa: SLF001
             gate.update_policy(_resolve(snap, ep, caller))
+
+    def invalidate(
+        self,
+        coalesce_key: str,
+        endpoint: str | None = None,
+        caller: str | None = None,
+    ) -> bool:
+        """主动作废某个合并 key 的在途/缓存只读结果（强制刷新）。
+
+        返回是否命中现存结果；对不存在/已作废的 key 重复调用安全无副作用。
+        等待中的调用方会收到可区分的 invalidated 结果，后续请求重新执行。
+        """
+        hit = self.coalescer.invalidate(coalesce_key)
+        self.metrics.record(endpoint, caller, invalidations=1)
+        logger.info(
+            "invalidate key=%s endpoint=%s caller=%s hit=%s",
+            coalesce_key, endpoint, caller, hit,
+        )
+        return hit
 
     async def handle(
         self,
@@ -203,6 +225,10 @@ class Governor:
                     return emit(make_outcome(
                         STATUS_FAILED, cause=exc, execute_time=execute_time))
         except GovernorError as exc:
+            if isinstance(exc, ResultInvalidated):
+                # 等待中的共享结果被判作废：可区分状态，不降级、不算拒绝；
+                # 准入槽位已随上下文退出正常释放，无计数漂移。
+                return emit(make_outcome(STATUS_INVALIDATED, cause=exc))
             if isinstance(exc, ClientCanceled):
                 out = make_outcome(STATUS_CANCELED, cause=exc)
                 # 取消也记录总耗时（若已在执行，排队耗时照常统计）

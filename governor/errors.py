@@ -35,6 +35,14 @@ class ClientCanceled(GovernorError):
     reason = "client_canceled"
 
 
+class ResultInvalidated(GovernorError):
+    """等待中的共享结果已被主动作废（强制刷新），调用方应重试以拿到新值。"""
+
+    status_code = 409
+    error_code = "result_invalidated"
+    reason = "invalidated"
+
+
 class Degraded(GovernorError):
     """内部信号：命中降级分支（不作为 HTTP 异常抛出）。"""
 
