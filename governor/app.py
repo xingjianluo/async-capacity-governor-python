@@ -25,6 +25,7 @@ from .governor import (
     STATUS_CACHE,
     STATUS_COALESCED,
     STATUS_DEGRADED,
+    STATUS_INVALIDATED,
     Governor,
 )
 from .metrics import MetricsRegistry
@@ -185,6 +186,30 @@ def create_app(store: ConfigStore | None = None) -> FastAPI:
             "flights": governor.coalescer.flight_count(),
         }
 
+    @app.post("/admin/invalidate")
+    async def admin_invalidate(request: Request) -> JSONResponse:
+        """主动作废某接口/调用方维度下的只读结果（在途合并执行与未过期缓存）。
+
+        请求体: {"endpoint": "items", "caller": "*", "coalesce_key": "items:k1"}
+        幂等：重复作废或作废不存在的结果均返回 applied=false，无副作用。
+        """
+        payload = await request.json()
+        try:
+            endpoint = str(payload["endpoint"])
+            coalesce_key = str(payload["coalesce_key"])
+            caller = str(payload.get("caller", "*"))
+        except (KeyError, TypeError) as exc:
+            return JSONResponse(
+                status_code=400,
+                content={"error": "invalid_request", "detail": str(exc)},
+            )
+        applied = governor.invalidate(endpoint, caller, coalesce_key)
+        return JSONResponse({
+            "status": "ok",
+            "applied": applied,
+            "coalesce_key": coalesce_key,
+        })
+
     @app.post("/admin/config")
     async def admin_config(request: Request) -> JSONResponse:
         payload = await request.json()
@@ -243,6 +268,18 @@ def _outcome_to_response(rid: str, outcome: Any) -> JSONResponse:
                 "request_id": rid,
                 "status": "canceled",
                 "error": "client_canceled",
+            },
+        )
+    if outcome.status == STATUS_INVALIDATED:
+        # 等待中的共享结果被主动作废：与拒绝/超时/取消可区分
+        return JSONResponse(
+            status_code=409,
+            content={
+                "request_id": rid,
+                "status": "invalidated",
+                "error": "result_invalidated",
+                "detail": str(outcome.cause) if outcome.cause else "invalidated",
+                "timing": _timing(outcome),
             },
         )
     # success / cache / coalesced / degraded

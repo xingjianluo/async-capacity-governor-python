@@ -46,6 +46,36 @@
 - 后端异常会广播给所有等待者，flight 立即清理，**不缓存错误**；
 - TTL 由 leader 的策略固定，在途/缓存中的响应不会被中途的配置切换改变。
 
+### 主动作废 / 强制刷新
+
+上游数据变更时，可主动作废某 key 的只读结果，强制后续请求重新计算：
+
+```bash
+curl -sX POST localhost:8000/admin/invalidate -H 'content-type: application/json' -d '{
+  "endpoint": "items", "caller": "*", "coalesce_key": "items:k1"
+}'
+# -> {"status":"ok","applied":true,"coalesce_key":"items:k1"}
+```
+
+语义（与合并、缓存的兼容范围）：
+
+- **在途合并执行中作废**：flight 立即从注册表摘除并打作废标记。后端执行
+  **不被取消**（跑完即丢弃，不进缓存、不广播旧值），所有等待者（含 leader）
+  收到 `409 result_invalidated` —— 与 `429 capacity_rejected`、
+  `503 queue_timeout`、`499 client_canceled` 明确区分；
+- **已缓存未过期作废**：直接摘除，下一个请求成为新 leader 重新执行，
+  绝不会读到作废前的旧值；
+- **作废后到达的请求**（包括作废时还在准入队列里、尚未进入合并层的请求）
+  视为新请求：成为新 flight 的 leader 重新执行，拿到最新结果；
+- **幂等无副作用**：重复作废、作废不存在的 key 都安全返回 `applied=false`；
+  作废本身不触发任何后端执行、不泄漏槽位、不影响其它 key 的在途请求；
+- **不触发降级**：作废不是容量/故障信号，配置了 `fallback_value` 也不会
+  返回兜底值（兜底值同样是旧数据）。
+
+指标：`invalidated`（请求侧收到作废结果的次数）与
+`invalidations`（运维侧作废实际生效次数）分开计数，均出现在
+`/admin/metrics` 的各维度中。
+
 ## 降级语义
 
 `Policy.fallback_value != null` 即开启降级。降级在两个时机触发，且响应可区分：
@@ -128,6 +158,7 @@ curl -sX POST localhost:8000/admin/config -H 'content-type: application/json' -d
 | `GET /report?caller=&delay=&fail=` | 降级演示（cap=1/queue=1/timeout=0.2s，fallback 为 `{"degraded":true,"items":[]}`） |
 | `GET /admin/metrics` | 指标与实时闸门状态 |
 | `POST /admin/config` | 运行时原子替换配置 |
+| `POST /admin/invalidate` | 主动作废只读结果（在途合并执行与未过期缓存），幂等 |
 | `GET /health` | 健康检查 |
 
 ## 运行与验证
@@ -136,8 +167,19 @@ curl -sX POST localhost:8000/admin/config -H 'content-type: application/json' -d
 uv sync
 uv run python main.py            # 启动服务（127.0.0.1:8000）
 
-uv run pytest                    # 27 个测试
+uv run pytest                    # 37 个测试
 uv run pytest -s                 # 查看每个请求的 req= / decision= / queued= / execute= 日志
+```
+
+本地验证作废 / 强制刷新：
+
+```bash
+# 终端 1：发起一个慢请求（合并窗口内在途）
+curl -s "localhost:8000/items/k1?caller=ops&delay=2" &
+# 终端 2：立即作废该 key 的在途结果
+curl -sX POST localhost:8000/admin/invalidate -H 'content-type: application/json' \
+  -d '{"endpoint":"items","caller":"*","coalesce_key":"items:k1"}'
+# 终端 1 的请求收到 409 result_invalidated；再次 GET 会重新执行拿到最新结果
 ```
 
 测试覆盖（均带请求标识、准入判定与耗时分解日志）：
@@ -150,7 +192,11 @@ uv run pytest -s                 # 查看每个请求的 req= / decision= / queu
 4. **相同请求合并**：N 个并发只读请求仅 1 次后端执行；TTL 内缓存、
    过期重算；follower/leader 取消隔离；失败不污染后续；
 5. **配置切换**：在途请求按旧策略跑完，新请求按新策略立即拒绝/放宽；
-   成功 / 拒绝 / 降级三类结果在状态码与 body 中均可区分。
+   成功 / 拒绝 / 降级三类结果在状态码与 body 中均可区分；
+6. **主动作废 / 强制刷新**：合并执行中作废（所有等待者收 409、旧值丢弃、
+   不重复执行）、缓存未过期作废（强制重算）、作废不存在/重复作废（安全幂等）、
+   作废与容量打满同时发生（拒绝语义不走样、压力过后恢复、槽位计数归零）、
+   其它 key 在途请求不受拖累。
 
 ## 代码结构
 
@@ -158,10 +204,10 @@ uv run pytest -s                 # 查看每个请求的 req= / decision= / queu
 governor/
   config.py     # Policy/Snapshot/ConfigStore（不可变快照、原子替换）
   admission.py  # AdmissionGate（FIFO 有界队列）+ AdmissionLimiter（按 key 管理）
-  coalescer.py  # singleflight + TTL 复用（leader/follower 生命周期）
+  coalescer.py  # singleflight + TTL 复用（leader/follower 生命周期、主动作废）
   metrics.py    # 三维度指标聚合
   governor.py   # 编排：准入 -> 合并 -> 执行 -> 降级 -> 指标/日志
   app.py        # FastAPI 装配、HTTP 响应映射、管理接口
-  errors.py     # 可区分异常：QueueRejected/QueueTimeout/ClientCanceled
-tests/          # 准入 / 合并 / 编排 / HTTP 端到端（含原生 ASGI 取消）
+  errors.py     # 可区分异常：QueueRejected/QueueTimeout/ClientCanceled/ResultInvalidated
+tests/          # 准入 / 合并 / 编排 / 作废 / HTTP 端到端（含原生 ASGI 取消）
 ```

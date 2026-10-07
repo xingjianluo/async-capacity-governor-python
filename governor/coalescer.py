@@ -7,7 +7,12 @@
 - follower 客户端取消抛 ClientCanceled，且不影响 leader 与其他 follower；
 - 成功结果按 leader 策略的 result_ttl 缓存，过期后下一个请求成为新 leader；
 - flight 的清理只由“最后一个离开者”（含 leader 自己）完成，避免计数漂移；
-- 在结果产生前，任何等待者都不会提前拿到值。
+- 在结果产生前，任何等待者都不会提前拿到值；
+- 主动作废（invalidate）：在途 flight 立即从注册表摘除并打作废标记，
+  后端执行不被取消（避免连带副作用），但结果落地即丢弃、绝不进缓存；
+  所有等待者收到 ResultInvalidated；已缓存未过期的 flight 直接摘除；
+  后续请求成为新 leader 重新执行，不会被作废前的旧值污染；
+- 作废是幂等无副作用的：重复作废或对不存在的 key 作废都安全返回 False。
 """
 
 from __future__ import annotations
@@ -16,7 +21,7 @@ import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from .errors import ClientCanceled
+from .errors import ClientCanceled, ResultInvalidated
 
 Factory = Callable[[], object]
 
@@ -28,6 +33,7 @@ class _Flight:
     result: object = None
     error: BaseException | None = None
     done: bool = False
+    invalidated: bool = False  # 作废标记：结果落地即丢弃，等待者收 ResultInvalidated
     waiters: int = 0  # 含 leader，leader 以 1 起步
     finished_at: float = 0.0
 
@@ -119,11 +125,30 @@ class Coalescer:
                 if self._flights.get(key) is fl:
                     self._flights.pop(key, None)
 
+        if fl.invalidated:
+            # 共享结果已被作废：任何等待者（含 leader）都不得使用旧值
+            raise ResultInvalidated("结果已被主动作废，需重新执行获取最新值")
         if is_cancelled is not None and is_cancelled():
             raise ClientCanceled("结果就绪后调用方已取消")
         if fl.error is not None:
             raise fl.error
         return fl.result, leader, cache_hit
+
+    def invalidate(self, key: str) -> bool:
+        """主动作废某 key 的只读结果（在途合并执行 / 已缓存未过期）。
+
+        - 在途：flight 立即从注册表摘除并打作废标记；后端执行不被取消
+          （跑完后结果直接丢弃、不进缓存），所有等待者收 ResultInvalidated；
+        - 已缓存：直接摘除，后续请求成为新 leader 重新执行；
+        - 不存在 / 重复作废：安全无操作，返回 False。
+
+        返回 True 表示本次调用实际作废了一个结果。
+        """
+        fl = self._flights.pop(key, None)
+        if fl is None:
+            return False
+        fl.invalidated = True
+        return True
 
     def flight_count(self) -> int:
         return len(self._flights)

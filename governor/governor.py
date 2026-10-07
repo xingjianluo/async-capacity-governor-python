@@ -21,6 +21,7 @@ from .errors import (
     GovernorError,
     QueueRejected,
     QueueTimeout,
+    ResultInvalidated,
 )
 from .metrics import (
     REASON_CAPACITY_FULL,
@@ -39,6 +40,7 @@ STATUS_DEGRADED = "degraded"          # 容量拒绝/执行失败后降级
 STATUS_REJECTED = "rejected"          # 容量拒绝（不降级）
 STATUS_FAILED = "failed"              # 执行失败（不降级）
 STATUS_CANCELED = "canceled"          # 客户端取消
+STATUS_INVALIDATED = "invalidated"    # 等待中的共享结果被主动作废（强制刷新）
 
 
 @dataclass
@@ -61,6 +63,7 @@ _COUNTER_MAP = {
     STATUS_REJECTED: "rejected",
     STATUS_FAILED: "failed",
     STATUS_CANCELED: "canceled",
+    STATUS_INVALIDATED: "invalidated",
 }
 
 
@@ -90,6 +93,22 @@ class Governor:
         snap = self.config.get()
         for (ep, caller), gate in self.limiter._gates.items():  # noqa: SLF001
             gate.update_policy(_resolve(snap, ep, caller))
+
+    def invalidate(self, endpoint: str, caller: str, coalesce_key: str) -> bool:
+        """主动作废指定维度下的只读结果（在途合并执行 / 已缓存未过期）。
+
+        - 等待该结果的调用方收到 STATUS_INVALIDATED（区别于拒绝/超时/取消）；
+        - 作废后新请求重新执行，不会被旧值污染；
+        - 重复作废 / 作废不存在的结果安全无副作用，返回 False。
+        """
+        invalidated = self.coalescer.invalidate(coalesce_key)
+        self.metrics.record(endpoint, caller,
+                            **({"invalidations": 1} if invalidated else {}))
+        logger.info(
+            "invalidate endpoint=%s caller=%s key=%s applied=%s",
+            endpoint, caller, coalesce_key, invalidated,
+        )
+        return invalidated
 
     async def handle(
         self,
@@ -218,6 +237,10 @@ class Governor:
                     queue_wait, out.total_time, executed,
                 )
                 return out
+            if isinstance(exc, ResultInvalidated):
+                # 共享结果在等待期间被作废：与拒绝/超时/取消明确区分，
+                # 不触发降级（作废不是容量问题，兜底值同样是旧数据）
+                return emit(make_outcome(STATUS_INVALIDATED, cause=exc))
             # QueueRejected / QueueTimeout
             out = make_outcome(
                 STATUS_DEGRADED if policy.degrade_enabled else STATUS_REJECTED,

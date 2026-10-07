@@ -4,7 +4,8 @@
 - 排队延迟 queue_wait_seconds 与处理/执行延迟 execute_seconds（含 total）；
 - 拒绝原因 reject_reasons：capacity_full / queue_timeout；
 - 实际执行量 executions（只统计真正调用后端的 leader 次数，合并者不算）；
-- 合并命中 coalesced 与缓存命中 cache_hit。
+- 合并命中 coalesced 与缓存命中 cache_hit；
+- 作废：invalidated（请求侧收到作废结果）与 invalidations（运维侧作废生效）。
 
 按 total / endpoint:<名> / caller:<名> 三个维度聚合，写入在事件循环线程内
 进行（单线程），快照读取做浅拷贝，避免计数漂移。
@@ -27,6 +28,8 @@ class ScopeMetrics:
     degraded: int = 0
     failed: int = 0
     canceled: int = 0
+    invalidated: int = 0      # 请求侧：等待中的结果被作废而收到 invalidated 的次数
+    invalidations: int = 0    # 运维侧：主动作废调用实际生效的次数
     coalesced: int = 0
     cache_hit: int = 0
     executions: int = 0
